@@ -64,26 +64,30 @@ void init_simulation(particle_t* parts, int num_parts, double size)
     // inside simulate_one_step() for each iteration.
 }
 
-inline void apply_force(particle_t &particle, particle_t &neighbor)
+void apply_force(particle_t &particle, particle_t &neighbor)
 {
     double dx = neighbor.x - particle.x;
     double dy = neighbor.y - particle.y;
-    double r2 = dx*dx + dy*dy;
+    double r2 = dx * dx + dy * dy;
 
-    if (r2 > cutoff*cutoff) {
-        return;
-    }
+    if (r2 > cutoff*cutoff) return;
 
     r2 = fmax(r2, min_r*min_r);
     double r = sqrt(r2);
     double coef = (1 - cutoff / r) / r2 / mass;
 
-    //"particle" gets a positive force, "neighbor" gets negative
+    // Use atomic updates to avoid race conditions
+    #pragma omp atomic
     particle.ax += coef * dx;
+    #pragma omp atomic
     particle.ay += coef * dy;
+    
+    #pragma omp atomic
     neighbor.ax -= coef * dx;
+    #pragma omp atomic
     neighbor.ay -= coef * dy;
 }
+
 
 inline void move(particle_t &p, double size)
 {
@@ -103,49 +107,55 @@ inline void move(particle_t &p, double size)
 }
 void simulate_one_step(particle_t* parts, int num_parts, double size)
 {
+    // Step 1: Clear all bins (parallelized)
     #pragma omp for
     for (int i = 0; i < num_bins * num_bins; i++) {
         bins[i].particles.clear();
     }
+
+    // Step 2: Assign particles to bins (parallelized, critical section for push_back)
     #pragma omp for
     for (int i = 0; i < num_parts; i++) {
-
         int bx = get_bin_index(parts[i].x);
         int by = get_bin_index(parts[i].y);
         int bin_id = get_bin_1d(bx, by);
 
+        // Critical section prevents race conditions when modifying bin contents
         #pragma omp critical
         {
             bins[bin_id].particles.push_back(i);
         }
+
+        // Store bin ID for later use
         particle_bin_ids[i] = bin_id;
     }
 
+    // Step 3: Reset accelerations for all particles (parallelized)
     #pragma omp for
     for (int i = 0; i < num_parts; i++) {
-        parts[i].ax = 0;
-        parts[i].ay = 0;
+        parts[i].ax = 0.0;
+        parts[i].ay = 0.0;
     }
 
-
+    // Step 4: Compute forces in parallel
     #pragma omp for schedule(static)
     for (int i = 0; i < num_parts; i++) {
         int bin_id = particle_bin_ids[i];
-        int bx = bin_id / num_bins; 
+        int bx = bin_id / num_bins;  // Convert 1D index back to 2D
         int by = bin_id % num_bins;
 
-    
+        // Loop over this bin and all 8 surrounding bins
         for (int nx = bx - 1; nx <= bx + 1; nx++) {
             if (nx < 0 || nx >= num_bins) continue;
+
             for (int ny = by - 1; ny <= by + 1; ny++) {
                 if (ny < 0 || ny >= num_bins) continue;
-                int neighbor_bin_id = nx * num_bins + ny;
 
-                // For each particle j in that neighbor bin
-                auto &neighbors = bins[neighbor_bin_id].particles;
+                int neighbor_bin_id = get_bin_1d(nx, ny);
+                std::vector<int>& neighbors = bins[neighbor_bin_id].particles;
+
                 for (int j : neighbors) {
-                    // Only apply force if i < j, so we do each pair once
-                    if (i < j) {
+                    if (i < j) { // Ensures each particle pair is computed only once
                         apply_force(parts[i], parts[j]);
                     }
                 }
@@ -153,12 +163,13 @@ void simulate_one_step(particle_t* parts, int num_parts, double size)
         }
     }
 
-    //Move each particle
+    // Step 5: Move particles (parallelized)
     #pragma omp for
     for (int i = 0; i < num_parts; i++) {
         move(parts[i], size);
     }
 }
+
 
 
 void cleanup_simulation()
