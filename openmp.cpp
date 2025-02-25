@@ -15,6 +15,7 @@ struct particle_node_t {
 
 struct bin_t {
     particle_node_t* head;        // Head of linked list
+    omp_lock_t lock;              // Lock for thread safety
 };
 
 // ===============================
@@ -52,11 +53,15 @@ void init_simulation(particle_t* parts, int num_parts, double size) {
     global_size = size;
     bin_size = cutoff;
     num_bins = static_cast<int>(size / bin_size) + 1;
+    if (num_bins < 1) {
+        num_bins = 1; // safety check
+    }
     
     // Allocate bins
     bins = new bin_t[num_bins * num_bins];
     for (int i = 0; i < num_bins * num_bins; i++) {
         bins[i].head = nullptr;
+        omp_init_lock(&bins[i].lock);
     }
 
     // Pre-allocate nodes (1 per particle)
@@ -81,9 +86,15 @@ void apply_force(particle_t &particle, particle_t &neighbor) {
     double r = sqrt(r2);
     double coef = (1 - cutoff / r) / r2 / mass;
 
+    // Use atomic operations to ensure correctness in parallel execution
+    #pragma omp atomic
     particle.ax += coef * dx;
+    #pragma omp atomic
     particle.ay += coef * dy;
+    
+    #pragma omp atomic
     neighbor.ax -= coef * dx;
+    #pragma omp atomic
     neighbor.ay -= coef * dy;
 }
 
@@ -118,17 +129,21 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
         bins[i].head = nullptr; // Reset linked list head
     }
 
-    // Step 2: Assign particles to bins (parallelized, no need for critical section)
+    // Step 2: Assign particles to bins (parallelized)
     #pragma omp for
     for (int i = 0; i < num_parts; i++) {
         int bx = get_bin_index(parts[i].x);
         int by = get_bin_index(parts[i].y);
         int bin_id = get_bin_1d(bx, by);
 
-        // Insert at head of linked list
+        // Set up node data
         nodes[i].particle_id = i;
+        
+        // Use fine-grained locking to add to bin safely
+        omp_set_lock(&bins[bin_id].lock);
         nodes[i].next = bins[bin_id].head;
         bins[bin_id].head = &nodes[i];
+        omp_unset_lock(&bins[bin_id].lock);
 
         // Store bin ID for later use
         particle_bin_ids[i] = bin_id;
@@ -179,7 +194,12 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
 // ===============================
 
 void cleanup_simulation() {
-    delete[] bins;
+    if (bins != nullptr) {
+        for (int i = 0; i < num_bins * num_bins; i++) {
+            omp_destroy_lock(&bins[i].lock);
+        }
+        delete[] bins;
+    }
     delete[] nodes;
     delete[] particle_bin_ids;
     bins = nullptr;
